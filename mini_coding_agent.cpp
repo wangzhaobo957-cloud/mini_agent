@@ -12,8 +12,10 @@
 //   5) Transcript + Memory + Resume -> history_ / memory_ / record / note_tool / remember
 //   6) Delegation & Bounded Subagent-> tool_delegate
 //
-// 模型端(ModelClient)是一个接口：这里给了一个脚本化的 FakeModelClient 让整个循环能离线跑；
-// 想接真实模型，照着注释实现一个 OllamaModelClient 即可（发 HTTP 到 /api/generate）。
+// 模型端(ModelClient)是一个接口，采用 function calling：工具以 JSON Schema 通过 API 的 tools 参数
+// 声明给模型，模型直接返回结构化的 tool_calls（要调工具）或最终文本（要收尾）。因此 prompt 里不再教
+// <tool>/<final> 格式，也不再需要正则容错解析。FakeModelClient 用脚本化的「结构化回复」离线跑通循环；
+// RemoteModelClient 调用 OpenAI 兼容接口（/v1/chat/completions + tools）。
 // ---------------------------------------------------------------------------
 
 #include <algorithm>
@@ -64,6 +66,7 @@ static std::string now() {
 // sh_capture: 执行一条 shell 命令并抓取其标准输出（用于收集 git 信息 / run_shell 工具）。
 static std::string sh_capture(const std::string &cmd) {
     std::string out;
+    //执行shell命令，获取标准输出
     FILE *pipe = popen(cmd.c_str(), "r");
     if (!pipe) return "";
     char buf[4096];
@@ -221,82 +224,28 @@ struct WorkspaceContext {
 };
 
 // ===========================================================================
-// 模型客户端接口 —— harness 与「大脑」之间唯一的边界
+// 数据结构：工具元数据 / 模型回复 / 历史条目 / 蒸馏记忆
+// （function calling 下，工具元数据既用于展示，也用于生成发给 API 的 JSON Schema）
 // ===========================================================================
-struct ModelClient {
-    virtual ~ModelClient() = default;
-    // complete: 输入一段完整 prompt 文本，返回模型生成的文本。模型是无状态的。
-    virtual std::string complete(const std::string &prompt, int max_new_tokens) = 0;
+
+// ToolSpec: 一个工具的元数据（名字、参数模式、是否危险、描述）。
+// schema 里每个参数的类型串形如 "str" / "str='.'" / "int=1"：带 '=' 表示有默认值(可选)，否则必填。
+struct ToolSpec {
+    std::string name;
+    std::vector<std::pair<std::string, std::string>> schema;  // 保留声明顺序
+    bool risky;
+    std::string description;
 };
 
-// FakeModelClient: 用预设脚本按顺序吐输出，让整条 agent 循环无需真实模型也能跑通。
-// （接真实模型时，改写成 OllamaModelClient：把 prompt POST 到 /api/generate 并取 response 字段。）
-struct FakeModelClient : ModelClient {
-    std::deque<std::string> outputs;
-    std::vector<std::string> seen_prompts;  // 记录每轮实际喂进去的 prompt，便于观察
-
-    explicit FakeModelClient(std::vector<std::string> outs)
-        : outputs(outs.begin(), outs.end()) {}
-
-    // complete: 记录本轮 prompt，然后弹出脚本里的下一条输出。
-    std::string complete(const std::string &prompt, int) override {
-        seen_prompts.push_back(prompt);
-        if (outputs.empty()) return "<final>fake model ran out of outputs</final>";
-        std::string out = outputs.front();
-        outputs.pop_front();
-        return out;
-    }
+// ModelReply: 模型一轮回复的结构化结果 —— function calling 的核心。
+// 要么请求调用一个工具(is_tool_call=true, tool_name+args)，要么给出最终文本(content)。
+// 对比文本协议：过去要靠 parse() 从自由文本里猜；现在模型直接给结构，无需解析、无需容错。
+struct ModelReply {
+    bool is_tool_call = false;
+    std::string tool_name;
+    std::map<std::string, std::string> args;
+    std::string content;   // 非工具调用时的最终答案（或错误信息）
 };
-
-// RemoteModelClient: 调用「OpenAI 兼容」的远程 Chat Completions API（/v1/chat/completions）。
-// 只要服务遵循该事实标准（OpenAI / DeepSeek / OpenRouter / Moonshot 等），换个 base_url + model 即可。
-// 与 FakeModelClient 的唯一区别：complete() 不查脚本，而是带着 API key 发 HTTPS 请求、等模型真实推理。
-struct RemoteModelClient : ModelClient {
-    std::string base_url;   // API 根地址，如 https://api.openai.com/v1
-    std::string model;      // 模型名，如 gpt-4o-mini / deepseek-chat
-    std::string api_key;    // 鉴权用的密钥（从环境变量读入，不硬编码）
-    double temperature;     // 采样温度，越低越稳定
-
-    // 构造函数：绑定服务地址、模型、密钥与温度（对应 CLI/环境变量）。
-    RemoteModelClient(std::string base_url, std::string model, std::string api_key,
-                      double temperature = 0.2)
-        : base_url(std::move(base_url)), model(std::move(model)),
-          api_key(std::move(api_key)), temperature(temperature) {}
-
-    // complete: 把 harness 拼好的 prompt 作为一条 user 消息发给远程模型，取回 assistant 文本。
-    std::string complete(const std::string &prompt, int max_new_tokens) override {
-        // 1) 拼 Chat Completions 请求体：单条 user 消息即可，harness 已把全部上下文塞进 prompt。
-        std::string body = std::string("{")
-            + "\"model\":" + json_quote(model) + ","
-            + "\"temperature\":" + std::to_string(temperature) + ","
-            + "\"max_tokens\":" + std::to_string(max_new_tokens) + ","
-            + "\"messages\":[{\"role\":\"user\",\"content\":" + json_quote(prompt) + "}]"
-            + "}";
-
-        // 2) 发 HTTPS POST，带上 Authorization: Bearer <key>。演示用 curl 子进程；生产建议 libcurl。
-        //    -s 静默、--fail-with-body 让 4xx/5xx 也把响应体带回来便于排错。
-        std::string url = base_url + "/chat/completions";
-        std::string cmd = "curl -s --fail-with-body -X POST " + shell_quote(url)
-            + " -H 'Content-Type: application/json'"
-            + " -H " + shell_quote("Authorization: Bearer " + api_key)
-            + " -d " + shell_quote(body);
-        std::string raw = sh_capture(cmd);
-
-        // 3) 从响应里抠出 choices[0].message.content。浅解析：先定位 content 字段即可。
-        std::string content = extract_json_string(raw, "content");
-        if (content.empty()) {
-            // 取不到内容通常是鉴权失败/限流/模型名错误：把原始响应回传给 harness，
-            // 让它作为一次坏输出走 parse 的 Retry 分支，而不是静默失败。
-            std::string err = extract_json_string(raw, "message");
-            return "<final>remote model error: " + (err.empty() ? clip(raw, 300) : err) + "</final>";
-        }
-        return content;
-    }
-};
-
-// ===========================================================================
-// 数据结构：历史条目 / 蒸馏记忆 / 工具元数据 / 解析结果
-// ===========================================================================
 
 // HistoryItem: 一条完整流水账（用户输入、模型回答、或一次工具调用及其结果）。
 struct HistoryItem {
@@ -314,23 +263,177 @@ struct Memory {
     std::vector<std::string> notes;
 };
 
-// ToolSpec: 一个工具的元数据（名字、参数模式、是否危险、描述），用于生成 prompt 里的工具清单。
-struct ToolSpec {
-    std::string name;
-    std::vector<std::pair<std::string, std::string>> schema;  // 保留声明顺序
-    bool risky;
-    std::string description;
+// ===========================================================================
+// function calling 辅助 —— 生成 tools 定义、解析模型返回的 arguments
+// ===========================================================================
+
+// tools_to_json_schema: 把 ToolSpec 列表转成 OpenAI function calling 要求的 tools 数组(JSON Schema)。
+// 这一步取代了旧版在 prompt 文本里用大白话列工具——现在以结构化契约的方式声明给模型。
+static std::string tools_to_json_schema(const std::vector<ToolSpec> &tools) {
+    std::ostringstream o;
+    o << "[";
+    for (size_t i = 0; i < tools.size(); ++i) {
+        const ToolSpec &t = tools[i];
+        std::vector<std::string> required;
+        o << "{\"type\":\"function\",\"function\":{"
+          << "\"name\":" << json_quote(t.name) << ","
+          << "\"description\":" << json_quote(t.description) << ","
+          << "\"parameters\":{\"type\":\"object\",\"properties\":{";
+        for (size_t j = 0; j < t.schema.size(); ++j) {
+            const auto &pr = t.schema[j];
+            // "int..." -> integer，其余 -> string；不含 '=' 视为必填参数。
+            std::string type = pr.second.rfind("int", 0) == 0 ? "integer" : "string";
+            if (pr.second.find('=') == std::string::npos) required.push_back(pr.first);
+            o << json_quote(pr.first) << ":{\"type\":\"" << type << "\"}";
+            if (j + 1 < t.schema.size()) o << ",";
+        }
+        o << "},\"required\":[";
+        for (size_t r = 0; r < required.size(); ++r) {
+            o << json_quote(required[r]);
+            if (r + 1 < required.size()) o << ",";
+        }
+        o << "]}}}";
+        if (i + 1 < tools.size()) o << ",";
+    }
+    o << "]";
+    return o.str();
+}
+
+// parse_flat_json_object: 把扁平 JSON 对象（如 {"path":"README.md","start":1}）解析成 string map。
+// 用于解读 tool_calls 里 function.arguments 那段 JSON——参数值统一转成字符串，交给现有工具实现。
+static std::map<std::string, std::string> parse_flat_json_object(const std::string &obj) {
+    std::map<std::string, std::string> out;
+    size_t b = obj.find('{');
+    if (b == std::string::npos) return out;
+    size_t i = b + 1;
+    auto skip_ws = [&]() { while (i < obj.size() && (obj[i] == ' ' || obj[i] == '\n' ||
+                                                      obj[i] == '\t' || obj[i] == '\r')) ++i; };
+    while (i < obj.size()) {
+        skip_ws();
+        if (i >= obj.size() || obj[i] == '}') break;
+        if (obj[i] != '"') break;               // 键必须是字符串
+        std::string key_raw; ++i;
+        for (; i < obj.size(); ++i) {
+            if (obj[i] == '\\') { key_raw += obj[i]; if (++i < obj.size()) key_raw += obj[i]; continue; }
+            if (obj[i] == '"') break;
+            key_raw += obj[i];
+        }
+        ++i; skip_ws();
+        if (i < obj.size() && obj[i] == ':') ++i;
+        skip_ws();
+        std::string val;
+        if (i < obj.size() && obj[i] == '"') {  // 字符串值：保留转义后统一反转义
+            std::string raw2; ++i;
+            for (; i < obj.size(); ++i) {
+                if (obj[i] == '\\') { raw2 += obj[i]; if (++i < obj.size()) raw2 += obj[i]; continue; }
+                if (obj[i] == '"') break;
+                raw2 += obj[i];
+            }
+            ++i; val = json_unescape(raw2);
+        } else {                                 // 数字/布尔等裸值
+            for (; i < obj.size() && obj[i] != ',' && obj[i] != '}'; ++i) val += obj[i];
+            val = trim(val);
+        }
+        out[key_raw] = val;
+        skip_ws();
+        if (i < obj.size() && obj[i] == ',') { ++i; continue; }
+        break;
+    }
+    return out;
+}
+
+// ===========================================================================
+// 模型客户端接口 —— harness 与「大脑」之间唯一的边界
+// ===========================================================================
+struct ModelClient {
+    virtual ~ModelClient() = default;
+    // complete: 输入完整 prompt + 可用工具定义，返回结构化回复（工具调用 或 最终文本）。
+    // 工具通过 tools 参数以 JSON Schema 声明给模型，模型直接返回结构，无需 prompt 教格式。
+    virtual ModelReply complete(const std::string &prompt,
+                                const std::vector<ToolSpec> &tools,
+                                int max_new_tokens) = 0;
 };
 
-// ParseKind: 模型每轮输出被归类为三种之一。
-enum class ParseKind { Tool, Final, Retry };
+// FakeModelClient: 用预设的「结构化回复」按顺序吐出，让整条 agent 循环无需真实模型也能跑通。
+// 每个 ModelReply 要么是工具调用、要么是最终文本——直接就是结构，无需再解析。
+struct FakeModelClient : ModelClient {
+    std::deque<ModelReply> outputs;
+    std::vector<std::string> seen_prompts;  // 记录每轮实际喂进去的 prompt，便于观察
 
-// ParseResult: parse() 的结构化产物。
-struct ParseResult {
-    ParseKind kind;//解析结果类型
-    std::string name;                          // Tool: 工具名
-    std::map<std::string, std::string> args;   // Tool: 参数
-    std::string text;                          // Final: 最终答案 / Retry: 提示语
+    explicit FakeModelClient(std::vector<ModelReply> outs)
+        : outputs(outs.begin(), outs.end()) {}
+
+    // complete: 记录本轮 prompt，然后弹出脚本里的下一条结构化回复（忽略 tools 参数）。
+    ModelReply complete(const std::string &prompt, const std::vector<ToolSpec> &, int) override {
+        seen_prompts.push_back(prompt);
+        if (outputs.empty()) {
+            ModelReply r; r.content = "fake model ran out of outputs"; return r;
+        }
+        ModelReply out = outputs.front();
+        outputs.pop_front();
+        return out;
+    }
+};
+
+// RemoteModelClient: 调用「OpenAI 兼容」的远程 Chat Completions API，并启用 function calling。
+// 工具经 tools 参数以 JSON Schema 声明；模型若要调工具则返回 tool_calls，否则返回 message.content。
+// 与文本协议版的根本区别：不在 prompt 里教 <tool>/<final>，也不用正则解析——直接读结构化字段。
+struct RemoteModelClient : ModelClient {
+    std::string base_url;   // API 根地址，如 https://api.openai.com/v1
+    std::string model;      // 模型名，如 gpt-4o-mini / deepseek-chat
+    std::string api_key;    // 鉴权用的密钥（从环境变量读入，不硬编码）
+    double temperature;     // 采样温度，越低越稳定
+
+    // 构造函数：绑定服务地址、模型、密钥与温度（对应 CLI/环境变量）。
+    RemoteModelClient(std::string base_url, std::string model, std::string api_key,
+                      double temperature = 0.2)
+        : base_url(std::move(base_url)), model(std::move(model)),
+          api_key(std::move(api_key)), temperature(temperature) {}
+
+    // complete: 带上 tools 定义发请求；解析响应——有 tool_calls 就返回工具调用，否则返回最终文本。
+    ModelReply complete(const std::string &prompt, const std::vector<ToolSpec> &tools,
+                        int max_new_tokens) override {
+        // 1) 拼请求体：单条 user 消息 + tools 定义。tool_choice=auto 让模型自行决定是否调工具。
+        std::string body = std::string("{")
+            + "\"model\":" + json_quote(model) + ","
+            + "\"temperature\":" + std::to_string(temperature) + ","
+            + "\"max_tokens\":" + std::to_string(max_new_tokens) + ","
+            + "\"tools\":" + tools_to_json_schema(tools) + ","
+            + "\"tool_choice\":\"auto\","
+            + "\"messages\":[{\"role\":\"user\",\"content\":" + json_quote(prompt) + "}]"
+            + "}";
+
+        // 2) 发 HTTPS POST，带上 Authorization: Bearer <key>。演示用 curl 子进程；生产建议 libcurl。
+        std::string url = base_url + "/chat/completions";
+        std::string cmd = "curl -s --fail-with-body -X POST " + shell_quote(url)
+            + " -H 'Content-Type: application/json'"
+            + " -H " + shell_quote("Authorization: Bearer " + api_key)
+            + " -d " + shell_quote(body);
+        std::string raw = sh_capture(cmd);
+
+        // 3) 解析响应。先看有没有 tool_calls：有则取 function.name + arguments 组成工具调用。
+        ModelReply reply;
+        size_t tc = raw.find("\"tool_calls\"");
+        if (tc != std::string::npos) {
+            // function.name 是 tool_calls 之后第一个 "name" 字段。
+            size_t np = raw.find("\"name\"", tc);
+            reply.tool_name = extract_json_string(raw.substr(np == std::string::npos ? tc : np), "name");
+            // arguments 是一段被转义的 JSON 字符串，取出后反转义再解析成参数 map。
+            std::string args_json = extract_json_string(raw.substr(tc), "arguments");
+            reply.args = parse_flat_json_object(args_json);
+            reply.is_tool_call = !reply.tool_name.empty();
+            if (reply.is_tool_call) return reply;
+        }
+        // 否则取 message.content 作为最终答案；都取不到则回传错误信息。
+        std::string content = extract_json_string(raw, "content");
+        if (content.empty()) {
+            std::string err = extract_json_string(raw, "message");
+            reply.content = "remote model error: " + (err.empty() ? clip(raw, 300) : err);
+        } else {
+            reply.content = content;
+        }
+        return reply;
+    }
 };
 
 // ===========================================================================
@@ -353,37 +456,30 @@ public:
     // -----------------------------------------------------------------------
     // 心脏：ask() —— 整个 agent 就是这个 while 循环
     // -----------------------------------------------------------------------
-    // ask: 接收一条用户请求，反复(拼prompt->调模型->解析->执行工具->记录)直到给出最终答案或触顶。
+    // ask: 接收一条用户请求，反复(拼prompt->调模型->执行工具->记录)直到给出最终答案或触顶。
+    // function calling 下模型直接返回结构化回复，无需 parse/容错/Retry 分支。
     std::string ask(const std::string &user_message) {
+        // 1) 记录用户输入
         if (memory_.task.empty()) memory_.task = clip(trim(user_message), 300);
         record({"user", "", {}, user_message, now()});
 
         int tool_steps = 0;
-        int attempts = 0;
-        const int max_attempts = std::max(max_steps_ * 3, max_steps_ + 4);
-        // 主循环：反复拼prompt->调模型->解析->执行工具->记录，直到触顶。
-        //tool_steps: 工具调用次数，attempts: 模型调用次数
-        while (tool_steps < max_steps_ && attempts < max_attempts) {
-            ++attempts;
-            std::string raw = model_.complete(prompt(user_message), 512);
-            ParseResult r = parse(raw);//解析模型输出，得到解析结果
+        // 主循环：反复拼prompt->调模型->执行工具->记录，直到给出最终答案或触顶。
+        while (tool_steps < max_steps_) {
+            // 把可用工具作为 tools 定义随请求一起发给模型（function calling 的声明端）。
+            ModelReply r = model_.complete(prompt(user_message), tools_, 512);
 
-            if (r.kind == ParseKind::Tool) {
+            if (r.is_tool_call) {
                 ++tool_steps;  // 只有真正的工具调用才消耗任务预算
-                std::string result = run_tool(r.name, r.args);//执行工具，得到结果
-                record({"tool", r.name, r.args, result, now()});//记录工具调用
-                note_tool(r.name, r.args, result);//记录工具调用结果    
+                std::string result = run_tool(r.tool_name, r.args);//执行工具，得到结果
+                record({"tool", r.tool_name, r.args, result, now()});//记录工具调用
+                note_tool(r.tool_name, r.args, result);//记录工具调用结果
                 continue;
             }
-            if (r.kind == ParseKind::Retry) {
-                // 模型格式坏了：记录一下但不烧 step 预算，直接重来。
-                record({"assistant", "", {}, r.text, now()});
-                continue;
-            }
-            // Final：给出最终答案，结束。
-            record({"assistant", "", {}, r.text, now()});
-            remember(memory_.notes, clip(r.text, 220), 5);
-            return r.text;
+            // 非工具调用：模型给出最终答案，结束。
+            record({"assistant", "", {}, r.content, now()});
+            remember(memory_.notes, clip(r.content, 220), 5);
+            return r.content;
         }
         std::string final = "Stopped after reaching the step limit without a final answer.";
         record({"assistant", "", {}, final, now()});
@@ -448,27 +544,17 @@ private:
     // =======================================================================
     // 组件 2：Prompt Shape —— 静态前缀 + 动态部分
     // =======================================================================
-    // build_prefix: 拼出「不变的」prompt 前缀（角色 + 规则 + 工具清单 + 示例 + 工作区快照）。
-    // 只在构造时调用一次，保证多轮请求共享同一前缀，利于模型侧 KV-cache 复用。
+    // build_prefix: 拼出「不变的」prompt 前缀（角色 + 少量规则 + 工作区快照）。
+    // 注意：function calling 下，工具清单与调用格式不再写进 prompt——它们通过 API 的 tools
+    // 参数以 JSON Schema 声明（见 tools_to_json_schema）。因此这里既没有工具列表，也没有
+    // <tool>/<final> 格式说明，前缀显著变短。只在构造时调用一次，利于模型侧 KV-cache 复用。
     std::string build_prefix() const {
-        std::ostringstream tools;
-        for (auto &t : tools_) {
-            tools << "- " << t.name << "(";
-            for (size_t i = 0; i < t.schema.size(); ++i)
-                tools << t.schema[i].first << ": " << t.schema[i].second
-                      << (i + 1 < t.schema.size() ? ", " : "");
-            tools << ") [" << (t.risky ? "approval required" : "safe") << "] " << t.description << "\n";
-        }
         std::ostringstream o;
         o << "You are Mini-Coding-Agent, a small local coding agent.\n\n"
           << "Rules:\n"
-          << "- Use tools instead of guessing about the workspace.\n"
-          << "- Return exactly one <tool .../> call or one <final>...</final> answer.\n"
-          << "- Tool calls look like: <tool name=\"read_file\" path=\"README.md\" start=\"1\" end=\"20\"></tool>\n"
-          << "- For file bodies use: <tool name=\"write_file\" path=\"x.txt\"><content>...</content></tool>\n"
+          << "- Use the provided tools instead of guessing about the workspace.\n"
           << "- Never invent tool results. Keep answers concise.\n\n"
-          << "Tools:\n" << tools.str() << "\n"//把所有的工具放进来
-          << ws_.text();//把工作区快照也放进来
+          << ws_.text();//把工作区快照放进来
         return o.str();
     }
 
@@ -608,67 +694,11 @@ private:
     }
 
     // =======================================================================
-    // 解析：把模型的文本输出解读为「工具调用 / 最终答案 / 需重试」
+    // 说明：文本协议版这里曾有 parse / parse_tool / extract 三个函数，
+    // 负责从模型自由文本里抠出 <tool>/<final> 并做容错。改用 function calling 后，
+    // 模型直接返回结构化的工具调用（tool_calls），这整套解析与容错逻辑全部消失——
+    // 解读工作前移到 RemoteModelClient::complete 里读取结构化字段即可。
     // =======================================================================
-    // parse: 判断输出里 <tool> 与 <final> 谁先出现，据此归类；空或畸形则要求重试。
-    ParseResult parse(const std::string &raw) const {
-        size_t pos_tool = raw.find("<tool");
-        size_t pos_final = raw.find("<final>");
-        bool tool_first = pos_tool != std::string::npos &&
-                          (pos_final == std::string::npos || pos_tool < pos_final);
-        if (tool_first) {
-            ParseResult r = parse_tool(raw);
-            if (r.name.empty())
-                return {ParseKind::Retry, "", {}, "malformed tool call; reply with a valid <tool> or <final>."};
-            return r;
-        }
-        if (pos_final != std::string::npos) {
-            std::string f = trim(extract(raw, "final"));
-            if (f.empty()) return {ParseKind::Retry, "", {}, "empty <final> answer; try again."};
-            return {ParseKind::Final, "", {}, f};
-        }
-        std::string t = trim(raw);
-        if (!t.empty()) return {ParseKind::Final, "", {}, t};
-        return {ParseKind::Retry, "", {}, "empty response; reply with <tool> or <final>."};
-    }
-
-    // parse_tool: 从 <tool ...>...</tool> 里抽出属性(name/path/...)与子标签(content/old_text/...)组成参数。
-    ParseResult parse_tool(const std::string &raw) const {
-        std::smatch m;
-        std::regex block(R"(<tool([^>]*)>([\s\S]*?)</tool>)");
-        if (!std::regex_search(raw, m, block)) return {ParseKind::Retry, "", {}, ""};
-        std::string attrs = m[1].str();
-        std::string body = m[2].str();
-
-        std::map<std::string, std::string> args;
-        std::regex attr(R"RX((\w+)\s*=\s*"([^"]*)")RX");
-        for (auto it = std::sregex_iterator(attrs.begin(), attrs.end(), attr);
-             it != std::sregex_iterator(); ++it)
-            args[(*it)[1].str()] = (*it)[2].str();
-
-        std::string name = args.count("name") ? args["name"] : "";
-        args.erase("name");
-        // 多行内容走子标签，避免让模型在属性里塞换行。
-        for (const char *k : {"content", "old_text", "new_text", "command", "task", "pattern"}) {
-            std::string open = std::string("<") + k + ">", close = std::string("</") + k + ">";
-            size_t s = body.find(open);
-            if (s == std::string::npos) continue;
-            s += open.size();
-            size_t e = body.find(close, s);
-            args[k] = (e == std::string::npos) ? body.substr(s) : body.substr(s, e - s);
-        }
-        return {ParseKind::Tool, name, args, ""};
-    }
-
-    // extract: 取出 <tag>...</tag> 之间的内容（用于 <final>）。
-    static std::string extract(const std::string &text, const std::string &tag) {
-        std::string open = "<" + tag + ">", close = "</" + tag + ">";
-        size_t s = text.find(open);
-        if (s == std::string::npos) return text;
-        s += open.size();
-        size_t e = text.find(close, s);
-        return e == std::string::npos ? text.substr(s) : text.substr(s, e - s);
-    }
 
     // =======================================================================
     // 路径沙箱：所有文件操作必须落在仓库根目录内
@@ -835,7 +865,7 @@ int main(int argc, char **argv) {
     std::string base_url = env_or("AGENT_BASE_URL", "https://api.openai.com/v1");
     std::string model_name = env_or("AGENT_MODEL", "gpt-4o-mini");
 
-    if (api_key.empty()) {
+    if (api_key.empty()) {//未设置环境变量 AGENT_API_KEY
         std::cerr << "error: 环境变量 AGENT_API_KEY 未设置。\n"
                   << "用法示例:\n"
                   << "  export AGENT_API_KEY=sk-xxx\n"
