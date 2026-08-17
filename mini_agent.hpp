@@ -1,10 +1,10 @@
 // mini_agent.hpp
 // ---------------------------------------------------------------------------
 // MiniAgent —— harness 本体。整个 agent 就是 ask() 里那个 while 循环：
-// 反复(拼prompt -> 调模型 -> 解析 -> 执行工具 -> 记录)，直到给出最终答案或触顶。
+// 反复(组装messages -> 调模型 -> 解析 -> 执行工具 -> 记录)，直到给出最终答案或触顶。
 //
 // 组件 -> 本文件符号 的映射：
-//   2) Prompt Shape & Cache Reuse   -> build_prefix / memory_text / prompt
+//   2) Prompt Shape & Cache Reuse   -> build_prefix / memory_text / request_messages
 //   3) Tools + Validation + Perms   -> build_tools / run_tool / approve / repeated_tool_call / tool_*
 //   4) Context Reduction            -> clip / history_text
 //   5) Transcript + Memory + Resume -> history_ / memory_ / record / note_tool / remember
@@ -52,33 +52,36 @@ public:
     // -----------------------------------------------------------------------
     // 心脏：ask() —— 整个 agent 就是这个 while 循环
     // -----------------------------------------------------------------------
-    // ask: 接收一条用户请求，反复(拼prompt->调模型->执行工具->记录)直到给出最终答案或触顶。
+    // ask: 接收一条用户请求，反复(组装messages->调模型->执行工具->记录)直到给出最终答案或触顶。
     // function calling 下模型直接返回结构化回复，无需 parse/容错/Retry 分支。
     std::string ask(const std::string &user_message) {
         // 1) 记录用户输入
         if (memory_.task.empty()) memory_.task = clip(trim(user_message), 300);
-        record({"user", "", {}, user_message, now()});
+        record({"user", "", {}, user_message, "", now()});
 
-        int tool_steps = 0;
-        // 主循环：反复拼prompt->调模型->执行工具->记录，直到给出最终答案或触顶。
+        int tool_steps = 0;// 工具调用次数
+        // 主循环：反复组装messages->调模型->执行工具->记录，直到给出最终答案或触顶。
         while (tool_steps < max_steps_) {
             // 把可用工具作为 tools 定义随请求一起发给模型（function calling 的声明端）。
-            ModelReply r = model_.complete(prompt(user_message), tools_, 512);
+            ModelReply r = model_.complete(request_messages(), tools_, 512);
 
             if (r.is_tool_call) {
                 ++tool_steps;  // 只有真正的工具调用才消耗任务预算
+                std::string call_id = r.tool_call_id.empty() ? make_tool_call_id() : r.tool_call_id;
+                record({"assistant", r.tool_name, r.args, "", call_id, now()});
                 std::string result = run_tool(r.tool_name, r.args);//执行工具，得到结果
-                record({"tool", r.tool_name, r.args, result, now()});//记录工具调用
+                record({"tool", r.tool_name, r.args, result, call_id, now()});//记录工具调用
                 note_tool(r.tool_name, r.args, result);//记录工具调用结果
                 continue;
             }
             // 非工具调用：模型给出最终答案，结束。
-            record({"assistant", "", {}, r.content, now()});
+            record({"assistant", "", {}, r.content, "", now()});
             remember(memory_.notes, clip(r.content, 220), 5);
             return r.content;
         }
-        std::string final = "Stopped after reaching the step limit without a final answer.";
-        record({"assistant", "", {}, final, now()});
+        std::string final = synthesize_after_step_limit();
+        record({"assistant", "", {}, final, "", now()});
+        remember(memory_.notes, clip(final, 220), 5);
         return final;
     }
 
@@ -160,7 +163,7 @@ private:
     }
 
     // =======================================================================
-    // 组件 2：Prompt Shape —— 静态前缀 + 动态部分
+    // 组件 2：Prompt Shape —— 静态前缀 + 动态 messages
     // =======================================================================
     // build_prefix: 拼出「不变的」prompt 前缀（角色 + 少量规则 + 工作区快照）。
     // 注意：function calling 下，工具清单与调用格式不再写进 prompt——它们通过 API 的 tools
@@ -171,26 +174,43 @@ private:
         o << "You are Mini-Coding-Agent, a small local coding agent.\n\n"
           << "Rules:\n"
           << "- Use the provided tools instead of guessing about the workspace.\n"
-          << "- Never invent tool results. Keep answers concise.\n\n"
+          << "- Never invent tool results. Keep answers concise.\n"
+          << "- Once you have enough information, stop calling tools and answer directly.\n\n"
           << ws_.text();//把工作区快照放进来
         return o.str();
     }
 
-    // prompt: 每轮把「静态前缀 + 蒸馏记忆 + 历史 + 当前请求」拼成最终喂给模型的完整文本。
-    std::string prompt(const std::string &user_message) const {
-        std::ostringstream o;
-        o << prefix_ << "\n\n" << memory_text() << "\nTranscript:\n"
-          << history_text() << "\n\nCurrent user request:\n" << user_message;
-        return o.str();
+    // request_messages: 每轮构造原生 messages 数组；system 放静态前缀和蒸馏记忆，历史保持结构化。
+    std::vector<HistoryItem> request_messages() const {
+        std::vector<HistoryItem> messages;
+        messages.push_back({"system", "", {}, prefix_ + "\n\n" + memory_text(), "", ""});
+        std::vector<HistoryItem> reduced = reduced_history();
+        messages.insert(messages.end(), reduced.begin(), reduced.end());
+        return messages;
+    }
+
+    // synthesize_after_step_limit: 工具预算耗尽时，禁用工具并要求模型基于已有观察结果直接收尾。
+    std::string synthesize_after_step_limit() {
+        std::vector<HistoryItem> messages = request_messages();
+        messages.push_back({
+            "user", "", {},
+            "Tool call budget is exhausted. Do not call tools. "
+            "Answer the latest user request directly using only the information already shown in the conversation. "
+            "If some details are uncertain, state the uncertainty briefly.",
+            "", now()
+        });
+        ModelReply r = model_.complete(messages, {}, 768);
+        if (r.content.empty()) return "Stopped after reaching the step limit without a final answer.";
+        return r.content;
     }
 
     // =======================================================================
     // 组件 4：Context Reduction —— 历史瘦身
     // =======================================================================
-    // history_text: 把历史序列化成文本，并做三件事：分级裁剪、重复读取去重、写操作使旧读取失效。
-    std::string history_text() const {
-        if (history_.empty()) return "- empty";
-        std::vector<std::string> lines;
+    // reduced_history: 对结构化历史做瘦身；去掉较早重复 read_file，并保持 assistant/tool 成对出现。
+    std::vector<HistoryItem> reduced_history() const {
+        std::vector<HistoryItem> out;
+        if (history_.empty()) return out;
         std::vector<std::string> seen_reads;  // 已经读过的文件路径
         size_t recent_start = history_.size() > 6 ? history_.size() - 6 : 0;
 
@@ -206,16 +226,37 @@ private:
             // 较早的重复 read_file 直接跳过（去重）。
             if (it.role == "tool" && it.name == "read_file" && !recent) {
                 auto p = it.args.count("path") ? it.args.at("path") : "";
-                if (std::find(seen_reads.begin(), seen_reads.end(), p) != seen_reads.end()) continue;
+                if (std::find(seen_reads.begin(), seen_reads.end(), p) != seen_reads.end()) {
+                    out.erase(std::remove_if(out.begin(), out.end(), [&](const HistoryItem &old) {
+                        return old.role == "assistant" && old.tool_call_id == it.tool_call_id;
+                    }), out.end());
+                    continue;
+                }
                 seen_reads.push_back(p);
             }
 
             size_t limit = recent ? 900 : 180;  // 越近的历史给越大额度
-            if (it.role == "tool") {
+            HistoryItem kept = it;
+            if (kept.role != "assistant" || kept.name.empty())
+                kept.content = clip(kept.content, limit);
+            out.push_back(kept);
+        }
+        return out;
+    }
+
+    // history_text: 把历史序列化成文本，供日志、摘要与 delegate 背景使用；主模型路径不再依赖它。
+    std::string history_text() const {
+        std::vector<HistoryItem> items = reduced_history();
+        if (items.empty()) return "- empty";
+        std::vector<std::string> lines;
+        for (const auto &it : items) {
+            if (it.role == "assistant" && !it.name.empty()) {
+                lines.push_back("[assistant.tool_call:" + it.name + "] " + args_to_string(it.args));
+            } else if (it.role == "tool") {
                 lines.push_back("[tool:" + it.name + "] " + args_to_string(it.args));
-                lines.push_back(clip(it.content, limit));
+                lines.push_back(it.content);
             } else {
-                lines.push_back("[" + it.role + "] " + clip(it.content, limit));
+                lines.push_back("[" + it.role + "] " + it.content);
             }
         }
         std::string joined;
@@ -241,6 +282,11 @@ private:
     // =======================================================================
     // record: 把一条历史追加到完整流水账（真实项目里此处会立即落盘以支持续接）。
     void record(const HistoryItem &item) { history_.push_back(item); }
+
+    // make_tool_call_id: 在 FakeModelClient 或兼容服务未返回 id 时，生成一个本地可配对的调用 id。
+    std::string make_tool_call_id() const {
+        return "call_local_" + std::to_string(history_.size() + 1);
+    }
 
     // note_tool: 从一次工具调用里蒸馏出「碰过的文件」与「一句话笔记」写入工作记忆。
     void note_tool(const std::string &name, const std::map<std::string, std::string> &args,

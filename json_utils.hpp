@@ -38,6 +38,18 @@ inline std::string json_quote(const std::string &s) {
     return o;
 }
 
+// flat_json_object: 把 string map 编码成一个扁平 JSON 对象（用于 function.arguments）。
+inline std::string flat_json_object(const std::map<std::string, std::string> &obj) {
+    std::string out = "{";
+    size_t i = 0;
+    for (const auto &kv : obj) {
+        out += json_quote(kv.first) + ":" + json_quote(kv.second);
+        if (++i < obj.size()) out += ",";
+    }
+    out += "}";
+    return out;
+}
+
 // shell_quote: 把字符串包成单引号安全的 shell 参数（用于把 JSON body 传给 curl -d）。
 // 单引号内一切原样，遇到内部的单引号用 '\'' 收尾再拼回，避免命令注入与解析错乱。
 inline std::string shell_quote(const std::string &s) {

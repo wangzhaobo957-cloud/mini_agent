@@ -1,12 +1,12 @@
-// mini_coding_agent.cpp
+// main.cc
 // ---------------------------------------------------------------------------
 // 一个「最小 harness」的 C++ 教学实现，对照 rasbt/mini-coding-agent 的 Python 版本。
-// 目标：用最少的代码把「agent = 在循环里反复(拼prompt -> 调模型 -> 解析 -> 执行工具 -> 记录)」
-// 这件事显式地摊开。仅依赖 C++17 标准库，g++ -std=c++17 mini_coding_agent.cpp 即可编译。
+// 目标：用最少的代码把「agent = 在循环里反复(组装messages -> 调模型 -> 解析 -> 执行工具 -> 记录)」
+// 这件事显式地摊开。仅依赖 C++17 标准库，g++ -std=c++17 main.cc 即可编译。
 //
 // 六大组件 -> 代码符号（及所在文件）的映射（与 Python 版一一对应）：
 //   1) Live Repo Context            -> WorkspaceContext              (workspace_context.hpp)
-//   2) Prompt Shape & Cache Reuse   -> build_prefix / memory_text / prompt   (mini_agent.hpp)
+//   2) Prompt Shape & Cache Reuse   -> build_prefix / memory_text / request_messages   (mini_agent.hpp)
 //   3) Tools + Validation + Perms   -> build_tools / run_tool / approve / tool_*  (mini_agent.hpp)
 //   4) Context Reduction            -> clip / history_text           (text_utils.hpp / mini_agent.hpp)
 //   5) Transcript + Memory + Resume -> history_ / memory_ / record / remember    (mini_agent.hpp)
@@ -23,7 +23,7 @@
 // <tool>/<final> 格式，也不再需要正则容错解析。FakeModelClient 用脚本化的「结构化回复」离线跑通循环；
 // RemoteModelClient 调用 OpenAI 兼容接口（/v1/chat/completions + tools）。
 //
-// 本文件只负责「组装」：读环境变量 -> 建工作区 -> 造模型/可选 MCP -> 构造 MiniAgent -> 跑一次任务。
+// 本文件只负责「组装」：读环境变量 -> 建工作区 -> 造模型/可选 MCP -> 构造 MiniAgent -> 进入交互循环。
 // 各类的定义已按组件拆分到上述头文件中，避免单文件过长、便于分模块阅读。
 // ---------------------------------------------------------------------------
 
@@ -38,7 +38,7 @@
 #include "workspace_context.hpp"  // WorkspaceContext
 
 // ===========================================================================
-// main —— 组装 workspace + 远程模型，让 agent 端到端跑一次任务
+// main —— 组装 workspace + 远程模型，让 agent 进入交互式问答循环
 // ===========================================================================
 
 // env_or: 读取环境变量，未设置时返回默认值（集中管理配置，避免把 key 硬编码进源码）。
@@ -47,7 +47,7 @@ static std::string env_or(const char *name, const std::string &fallback) {
     return (v && *v) ? std::string(v) : fallback;
 }
 
-// main: 从环境变量读取远程模型配置（base_url/model/api_key），构造 agent 并执行一次任务。
+// main: 从环境变量读取远程模型配置（base_url/model/api_key），构造 agent 并持续读取用户请求。
 int main(int argc, char **argv) {
     std::string dir = argc > 1 ? argv[1] : ".";
     //建立工作区快照，记录当前目录下的所有文件，工作区快照
@@ -55,18 +55,18 @@ int main(int argc, char **argv) {
 
     // 配置来自环境变量：
     //   AGENT_API_KEY   必填，远程模型的密钥（不写进源码/命令行，避免泄露）
-    //   AGENT_BASE_URL  可选，OpenAI 兼容 API 根地址，默认 OpenAI 官方
-    //   AGENT_MODEL     可选，模型名，默认 gpt-4o-mini
+    //   AGENT_BASE_URL  可选，OpenAI 兼容 API 根地址，默认 DeepSeek
+    //   AGENT_MODEL     可选，模型名，默认 DeepSeek 最便宜的通用模型 deepseek-chat
     std::string api_key  = env_or("AGENT_API_KEY", "");
-    std::string base_url = env_or("AGENT_BASE_URL", "https://api.openai.com/v1");
-    std::string model_name = env_or("AGENT_MODEL", "gpt-4o-mini");
+    std::string base_url = env_or("AGENT_BASE_URL", "https://api.deepseek.com/v1");
+    std::string model_name = env_or("AGENT_MODEL", "deepseek-chat");
 
     if (api_key.empty()) {//未设置环境变量 AGENT_API_KEY
         std::cerr << "error: 环境变量 AGENT_API_KEY 未设置。\n"
                   << "用法示例:\n"
                   << "  export AGENT_API_KEY=sk-xxx\n"
-                  << "  export AGENT_BASE_URL=https://api.openai.com/v1   # 可选\n"
-                  << "  export AGENT_MODEL=gpt-4o-mini                    # 可选\n"
+                  << "  export AGENT_BASE_URL=https://api.deepseek.com/v1 # 可选\n"
+                  << "  export AGENT_MODEL=deepseek-chat                  # 可选\n"
                   << "  ./mini_agent [workspace_dir]\n";
         return 1;
     }
@@ -94,15 +94,24 @@ int main(int argc, char **argv) {
     }
 
     // approval=ask：真实模型可能提出危险操作，默认逐个确认（trusted 场景可改 auto）。
-    MiniAgent agent(model, ws, /*approval=*/"ask", /*max_steps=*/6,
+    MiniAgent agent(model, ws, /*approval=*/"ask", /*max_steps=*/10,
                     /*depth=*/0, /*max_depth=*/1, /*read_only=*/false, /*mcp=*/mcp_ptr);
 
     std::cout << "=== MINI CODING AGENT (C++) ===\n"
               << "workspace: " << ws.cwd << " | branch: " << ws.branch << "\n"
-              << "model: " << model.model << " @ " << base_url << "\n\n";
+              << "model: " << model.model << " @ " << base_url << "\n"
+              << "输入你的问题；输入 /exit 或 /quit 退出。\n\n";
 
-    std::string answer = agent.ask("列出目录，读一下 README 开头，然后创建一个示例文件。");
-    std::cout << "\n[final answer] " << answer << "\n\n";
-    std::cout << agent.memory_text() << "\n";
+    std::string question;
+    while (true) {
+        std::cout << "mini-agent> " << std::flush;
+        if (!std::getline(std::cin, question)) break;
+        question = trim(question);
+        if (question.empty()) continue;
+        if (question == "/exit" || question == "/quit") break;
+
+        std::string answer = agent.ask(question);
+        std::cout << "\n[final answer] " << answer << "\n\n";
+    }
     return 0;
 }

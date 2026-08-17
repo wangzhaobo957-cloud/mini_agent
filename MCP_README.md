@@ -8,7 +8,7 @@
 |---|---|---|
 | `mcp_server_demo.py` | **MCP Server**（独立进程） | 用 Python 写，通过 JSON-RPC 2.0 over stdio 暴露工具。用另一种语言，正是为了强调"工具提供方和 harness 完全解耦"。 |
 | `mcp_client.hpp` | **MCP Client**（harness 侧） | 自包含头文件。用 fork/exec 拉起 server 子进程，建立双向管道，收发 JSON-RPC。 |
-| `mini_coding_agent.cpp` | **harness 本体** | 仅两处接入点改动（见下），循环/记忆/审批一律未动。 |
+| `main.cc` | **入口与 harness 组装** | 读取环境变量，构造 Workspace/Model/MCP/MiniAgent，并执行一次任务。 |
 
 ## 协议
 
@@ -23,7 +23,7 @@ JSON-RPC 2.0，逐行 JSON（每条消息一行、`\n` 结尾），走子进程�
 MCP 是**可选**的，由环境变量 `AGENT_MCP_CMD` 控制。不设置就只用本地工具，行为和以前完全一致。
 
 ```bash
-g++ -std=c++17 -Wall -o mini_agent mini_coding_agent.cpp
+g++ -std=c++17 -Wall -o mini_agent main.cc
 
 export AGENT_API_KEY=sk-xxx
 export AGENT_MCP_CMD="python3 mcp_server_demo.py"   # 关键：启用 MCP

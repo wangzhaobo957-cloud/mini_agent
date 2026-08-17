@@ -18,7 +18,7 @@
 #include <utility>
 #include <vector>
 
-#include "agent_types.hpp"  // ToolSpec / ModelReply
+#include "agent_types.hpp"  // ToolSpec / ModelReply / HistoryItem
 #include "json_utils.hpp"    // json_quote / shell_quote / extract_json_string / parse_flat_json_object
 #include "text_utils.hpp"    // clip / sh_capture
 
@@ -54,14 +54,41 @@ inline std::string tools_to_json_schema(const std::vector<ToolSpec> &tools) {
     return o.str();
 }
 
+// messages_to_json: 把结构化历史序列化成 OpenAI 原生 messages 数组。
+// assistant 的工具调用保留为 tool_calls 字段，tool 结果用 tool_call_id 精确关联。
+inline std::string messages_to_json(const std::vector<HistoryItem> &messages) {
+    std::ostringstream o;
+    o << "[";
+    for (size_t i = 0; i < messages.size(); ++i) {
+        const HistoryItem &m = messages[i];
+        o << "{\"role\":" << json_quote(m.role);
+        if (m.role == "assistant" && !m.name.empty()) {
+            o << ",\"content\":null,\"tool_calls\":[{"
+              << "\"id\":" << json_quote(m.tool_call_id) << ","
+              << "\"type\":\"function\","
+              << "\"function\":{\"name\":" << json_quote(m.name)
+              << ",\"arguments\":" << json_quote(flat_json_object(m.args)) << "}}]";
+        } else if (m.role == "tool") {
+            o << ",\"tool_call_id\":" << json_quote(m.tool_call_id)
+              << ",\"content\":" << json_quote(m.content);
+        } else {
+            o << ",\"content\":" << json_quote(m.content);
+        }
+        o << "}";
+        if (i + 1 < messages.size()) o << ",";
+    }
+    o << "]";
+    return o.str();
+}
+
 // ===========================================================================
 // 模型客户端接口 —— harness 与「大脑」之间唯一的边界
 // ===========================================================================
 struct ModelClient {
     virtual ~ModelClient() = default;
-    // complete: 输入完整 prompt + 可用工具定义，返回结构化回复（工具调用 或 最终文本）。
+    // complete: 输入原生 messages 数组 + 可用工具定义，返回结构化回复（工具调用 或 最终文本）。
     // 工具通过 tools 参数以 JSON Schema 声明给模型，模型直接返回结构，无需 prompt 教格式。
-    virtual ModelReply complete(const std::string &prompt,
+    virtual ModelReply complete(const std::vector<HistoryItem> &messages,
                                 const std::vector<ToolSpec> &tools,
                                 int max_new_tokens) = 0;
 };
@@ -70,14 +97,15 @@ struct ModelClient {
 // 每个 ModelReply 要么是工具调用、要么是最终文本——直接就是结构，无需再解析。
 struct FakeModelClient : ModelClient {
     std::deque<ModelReply> outputs;
-    std::vector<std::string> seen_prompts;  // 记录每轮实际喂进去的 prompt，便于观察
+    std::vector<std::vector<HistoryItem>> seen_messages;  // 记录每轮实际喂进去的 messages，便于观察
 
     explicit FakeModelClient(std::vector<ModelReply> outs)
         : outputs(outs.begin(), outs.end()) {}
 
-    // complete: 记录本轮 prompt，然后弹出脚本里的下一条结构化回复（忽略 tools 参数）。
-    ModelReply complete(const std::string &prompt, const std::vector<ToolSpec> &, int) override {
-        seen_prompts.push_back(prompt);
+    // complete: 记录本轮 messages，然后弹出脚本里的下一条结构化回复（忽略 tools 参数）。
+    ModelReply complete(const std::vector<HistoryItem> &messages,
+                        const std::vector<ToolSpec> &, int) override {
+        seen_messages.push_back(messages);
         if (outputs.empty()) {
             ModelReply r; r.content = "fake model ran out of outputs"; return r;
         }
@@ -103,17 +131,19 @@ struct RemoteModelClient : ModelClient {
           api_key(std::move(api_key)), temperature(temperature) {}
 
     // complete: 带上 tools 定义发请求；解析响应——有 tool_calls 就返回工具调用，否则返回最终文本。
-    ModelReply complete(const std::string &prompt, const std::vector<ToolSpec> &tools,
+    ModelReply complete(const std::vector<HistoryItem> &messages,
+                        const std::vector<ToolSpec> &tools,
                         int max_new_tokens) override {
-        // 1) 拼请求体：单条 user 消息 + tools 定义。tool_choice=auto 让模型自行决定是否调工具。
+        // 1) 拼请求体：原生 messages + 可选 tools 定义。无工具时不发送 tool_choice，强制文本回答。
         std::string body = std::string("{")
             + "\"model\":" + json_quote(model) + ","
             + "\"temperature\":" + std::to_string(temperature) + ","
-            + "\"max_tokens\":" + std::to_string(max_new_tokens) + ","
-            + "\"tools\":" + tools_to_json_schema(tools) + ","
-            + "\"tool_choice\":\"auto\","
-            + "\"messages\":[{\"role\":\"user\",\"content\":" + json_quote(prompt) + "}]"
-            + "}";
+            + "\"max_tokens\":" + std::to_string(max_new_tokens) + ",";
+        if (!tools.empty()) {
+            body += "\"tools\":" + tools_to_json_schema(tools) + ","
+                  + "\"tool_choice\":\"auto\",";
+        }
+        body += "\"messages\":" + messages_to_json(messages) + "}";
 
         // 2) 发 HTTPS POST，带上 Authorization: Bearer <key>。演示用 curl 子进程；生产建议 libcurl。
         std::string url = base_url + "/chat/completions";
@@ -127,6 +157,8 @@ struct RemoteModelClient : ModelClient {
         ModelReply reply;
         size_t tc = raw.find("\"tool_calls\"");
         if (tc != std::string::npos) {
+            // id 是本次 tool_call 的唯一标识，下一轮 tool 消息必须用它指回。
+            reply.tool_call_id = extract_json_string(raw.substr(tc), "id");
             // function.name 是 tool_calls 之后第一个 "name" 字段。
             size_t np = raw.find("\"name\"", tc);
             reply.tool_name = extract_json_string(raw.substr(np == std::string::npos ? tc : np), "name");

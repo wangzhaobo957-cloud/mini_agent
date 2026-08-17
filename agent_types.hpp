@@ -28,15 +28,17 @@ struct ModelReply {
     bool is_tool_call = false;
     std::string tool_name;
     std::map<std::string, std::string> args;
+    std::string tool_call_id;  // 工具调用 id，用于把 assistant.tool_calls 与 tool 结果配对
     std::string content;   // 非工具调用时的最终答案（或错误信息）
 };
 
-// HistoryItem: 一条完整流水账（用户输入、模型回答、或一次工具调用及其结果）。
+// HistoryItem: 一条原生 chat message（system/user/assistant/tool）及其工具调用元数据。
 struct HistoryItem {
-    std::string role;                          // "user" / "assistant" / "tool"
-    std::string name;                          // 当 role=="tool" 时的工具名
+    std::string role;                          // "system" / "user" / "assistant" / "tool"
+    std::string name;                          // assistant 发起工具调用或 tool 返回结果时的工具名
     std::map<std::string, std::string> args;   // 工具参数
     std::string content;                       // 文本内容 / 工具返回
+    std::string tool_call_id;                  // 关联 assistant.tool_calls 与 tool 结果
     std::string created_at;
 };
 
