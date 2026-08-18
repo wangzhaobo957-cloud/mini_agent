@@ -18,7 +18,7 @@
 #include <utility>
 #include <vector>
 
-#include "agent_types.hpp"  // ToolSpec / ModelReply / HistoryItem
+#include "agent_types.hpp"  // ToolSpec / ToolCall / ModelReply / HistoryItem
 #include "json_utils.hpp"    // json_quote / shell_quote / extract_json_string / parse_flat_json_object
 #include "text_utils.hpp"    // clip / sh_capture
 
@@ -54,6 +54,28 @@ inline std::string tools_to_json_schema(const std::vector<ToolSpec> &tools) {
     return o.str();
 }
 
+// tool_calls_to_json: 把一批工具调用序列化成 assistant.tool_calls 数组。
+inline std::string tool_calls_to_json(const std::vector<ToolCall> &calls) {
+    std::ostringstream o;
+    o << "[";
+    for (size_t i = 0; i < calls.size(); ++i) {
+        const ToolCall &c = calls[i];
+        o << "{\"id\":" << json_quote(c.id)
+          << ",\"type\":\"function\","
+          << "\"function\":{\"name\":" << json_quote(c.name)
+          << ",\"arguments\":" << json_quote(flat_json_object(c.args)) << "}}";
+        if (i + 1 < calls.size()) o << ",";
+    }
+    o << "]";
+    return o.str();
+}
+
+// history_tool_calls: 取出 assistant 消息里携带的一批 tool_calls。
+inline std::vector<ToolCall> history_tool_calls(const HistoryItem &m) {
+    if (!m.tool_calls.empty()) return m.tool_calls;
+    return {};
+}
+
 // messages_to_json: 把结构化历史序列化成 OpenAI 原生 messages 数组。
 // assistant 的工具调用保留为 tool_calls 字段，tool 结果用 tool_call_id 精确关联。
 inline std::string messages_to_json(const std::vector<HistoryItem> &messages) {
@@ -61,13 +83,10 @@ inline std::string messages_to_json(const std::vector<HistoryItem> &messages) {
     o << "[";
     for (size_t i = 0; i < messages.size(); ++i) {
         const HistoryItem &m = messages[i];
+        std::vector<ToolCall> calls = history_tool_calls(m);
         o << "{\"role\":" << json_quote(m.role);
-        if (m.role == "assistant" && !m.name.empty()) {
-            o << ",\"content\":null,\"tool_calls\":[{"
-              << "\"id\":" << json_quote(m.tool_call_id) << ","
-              << "\"type\":\"function\","
-              << "\"function\":{\"name\":" << json_quote(m.name)
-              << ",\"arguments\":" << json_quote(flat_json_object(m.args)) << "}}]";
+        if (m.role == "assistant" && !calls.empty()) {
+            o << ",\"content\":null,\"tool_calls\":" << tool_calls_to_json(calls);
         } else if (m.role == "tool") {
             o << ",\"tool_call_id\":" << json_quote(m.tool_call_id)
               << ",\"content\":" << json_quote(m.content);
@@ -79,6 +98,65 @@ inline std::string messages_to_json(const std::vector<HistoryItem> &messages) {
     }
     o << "]";
     return o.str();
+}
+
+// find_matching_json: 从 open_pos 开始找匹配的 JSON 闭合符，跳过字符串内部的括号。
+inline size_t find_matching_json(const std::string &s, size_t open_pos, char open, char close) {
+    bool in_string = false, escape = false;
+    int depth = 0;
+    for (size_t i = open_pos; i < s.size(); ++i) {
+        char c = s[i];
+        if (escape) { escape = false; continue; }
+        if (c == '\\' && in_string) { escape = true; continue; }
+        if (c == '"') { in_string = !in_string; continue; }
+        if (in_string) continue;
+        if (c == open) ++depth;
+        if (c == close && --depth == 0) return i;
+    }
+    return std::string::npos;
+}
+
+// extract_json_array: 从一段 JSON 文本中取出指定 key 后面的数组文本。
+inline std::string extract_json_array(const std::string &json, const std::string &key) {
+    std::string needle = "\"" + key + "\"";
+    size_t k = json.find(needle);
+    if (k == std::string::npos) return "";
+    size_t colon = json.find(':', k + needle.size());
+    if (colon == std::string::npos) return "";
+    size_t b = json.find('[', colon);
+    if (b == std::string::npos) return "";
+    size_t e = find_matching_json(json, b, '[', ']');
+    if (e == std::string::npos) return "";
+    return json.substr(b, e - b + 1);
+}
+
+// split_json_objects: 把 JSON 数组中的顶层对象逐个切出来。
+inline std::vector<std::string> split_json_objects(const std::string &array_json) {
+    std::vector<std::string> out;
+    for (size_t i = 0; i < array_json.size(); ++i) {
+        if (array_json[i] != '{') continue;
+        size_t e = find_matching_json(array_json, i, '{', '}');
+        if (e == std::string::npos) break;
+        out.push_back(array_json.substr(i, e - i + 1));
+        i = e;
+    }
+    return out;
+}
+
+// parse_tool_calls: 解析模型响应里的 tool_calls 数组，支持同一轮多个工具调用。
+inline std::vector<ToolCall> parse_tool_calls(const std::string &raw) {
+    std::vector<ToolCall> calls;
+    std::string array_json = extract_json_array(raw, "tool_calls");
+    for (const std::string &obj : split_json_objects(array_json)) {
+        ToolCall call;
+        call.id = extract_json_string(obj, "id");
+        size_t np = obj.find("\"name\"");
+        call.name = extract_json_string(obj.substr(np == std::string::npos ? 0 : np), "name");
+        std::string args_json = extract_json_string(obj, "arguments");
+        call.args = parse_flat_json_object(args_json);
+        if (!call.name.empty()) calls.push_back(call);
+    }
+    return calls;
 }
 
 // ===========================================================================
@@ -95,25 +173,25 @@ struct ModelClient {
 
 // FakeModelClient: 用预设的「结构化回复」按顺序吐出，让整条 agent 循环无需真实模型也能跑通。
 // 每个 ModelReply 要么是工具调用、要么是最终文本——直接就是结构，无需再解析。
-struct FakeModelClient : ModelClient {
-    std::deque<ModelReply> outputs;
-    std::vector<std::vector<HistoryItem>> seen_messages;  // 记录每轮实际喂进去的 messages，便于观察
+// struct FakeModelClient : ModelClient {
+//     std::deque<ModelReply> outputs;
+//     std::vector<std::vector<HistoryItem>> seen_messages;  // 记录每轮实际喂进去的 messages，便于观察
 
-    explicit FakeModelClient(std::vector<ModelReply> outs)
-        : outputs(outs.begin(), outs.end()) {}
+//     explicit FakeModelClient(std::vector<ModelReply> outs)
+//         : outputs(outs.begin(), outs.end()) {}
 
-    // complete: 记录本轮 messages，然后弹出脚本里的下一条结构化回复（忽略 tools 参数）。
-    ModelReply complete(const std::vector<HistoryItem> &messages,
-                        const std::vector<ToolSpec> &, int) override {
-        seen_messages.push_back(messages);
-        if (outputs.empty()) {
-            ModelReply r; r.content = "fake model ran out of outputs"; return r;
-        }
-        ModelReply out = outputs.front();
-        outputs.pop_front();
-        return out;
-    }
-};
+//     // complete: 记录本轮 messages，然后弹出脚本里的下一条结构化回复（忽略 tools 参数）。
+//     ModelReply complete(const std::vector<HistoryItem> &messages,
+//                         const std::vector<ToolSpec> &, int) override {
+//         seen_messages.push_back(messages);
+//         if (outputs.empty()) {
+//             ModelReply r; r.content = "fake model ran out of outputs"; return r;
+//         }
+//         ModelReply out = outputs.front();
+//         outputs.pop_front();
+//         return out;
+//     }
+// };
 
 // RemoteModelClient: 调用「OpenAI 兼容」的远程 Chat Completions API，并启用 function calling。
 // 工具经 tools 参数以 JSON Schema 声明；模型若要调工具则返回 tool_calls，否则返回 message.content。
@@ -140,6 +218,7 @@ struct RemoteModelClient : ModelClient {
             + "\"temperature\":" + std::to_string(temperature) + ","
             + "\"max_tokens\":" + std::to_string(max_new_tokens) + ",";
         if (!tools.empty()) {
+            //把tools转换为JSON Schema
             body += "\"tools\":" + tools_to_json_schema(tools) + ","
                   + "\"tool_choice\":\"auto\",";
         }
@@ -153,19 +232,18 @@ struct RemoteModelClient : ModelClient {
             + " -d " + shell_quote(body);
         std::string raw = sh_capture(cmd);
 
-        // 3) 解析响应。先看有没有 tool_calls：有则取 function.name + arguments 组成工具调用。
+        // 3) 解析响应。先看有没有 tool_calls：有则解析整批 id/name/arguments 组成工具调用。
         ModelReply reply;
         size_t tc = raw.find("\"tool_calls\"");
         if (tc != std::string::npos) {
-            // id 是本次 tool_call 的唯一标识，下一轮 tool 消息必须用它指回。
-            reply.tool_call_id = extract_json_string(raw.substr(tc), "id");
-            // function.name 是 tool_calls 之后第一个 "name" 字段。
-            size_t np = raw.find("\"name\"", tc);
-            reply.tool_name = extract_json_string(raw.substr(np == std::string::npos ? tc : np), "name");
-            // arguments 是一段被转义的 JSON 字符串，取出后反转义再解析成参数 map。
-            std::string args_json = extract_json_string(raw.substr(tc), "arguments");
-            reply.args = parse_flat_json_object(args_json);
-            reply.is_tool_call = !reply.tool_name.empty();
+            reply.tool_calls = parse_tool_calls(raw.substr(tc));
+            for (const ToolCall &call : reply.tool_calls) {
+                if (call.id.empty() || call.name.empty()) {
+                    reply.content = "remote model error: invalid tool_call without id or name";
+                    return reply;
+                }
+            }
+            reply.is_tool_call = !reply.tool_calls.empty();
             if (reply.is_tool_call) return reply;
         }
         // 否则取 message.content 作为最终答案；都取不到则回传错误信息。

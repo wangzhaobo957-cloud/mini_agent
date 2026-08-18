@@ -57,7 +57,7 @@ public:
     std::string ask(const std::string &user_message) {
         // 1) 记录用户输入
         if (memory_.task.empty()) memory_.task = clip(trim(user_message), 300);
-        record({"user", "", {}, user_message, "", now()});
+        record({"user", "", {}, user_message, "", now(), {}});
 
         int tool_steps = 0;// 工具调用次数
         // 主循环：反复组装messages->调模型->执行工具->记录，直到给出最终答案或触顶。
@@ -66,21 +66,23 @@ public:
             ModelReply r = model_.complete(request_messages(), tools_, 512);
 
             if (r.is_tool_call) {
-                ++tool_steps;  // 只有真正的工具调用才消耗任务预算
-                std::string call_id = r.tool_call_id.empty() ? make_tool_call_id() : r.tool_call_id;
-                record({"assistant", r.tool_name, r.args, "", call_id, now()});
-                std::string result = run_tool(r.tool_name, r.args);//执行工具，得到结果
-                record({"tool", r.tool_name, r.args, result, call_id, now()});//记录工具调用
-                note_tool(r.tool_name, r.args, result);//记录工具调用结果
+                std::vector<ToolCall> calls = r.tool_calls;
+                record({"assistant", "", {}, "", "", now(), calls});
+                for (const ToolCall &call : calls) {
+                    ++tool_steps;  // 每个具体工具调用都消耗任务预算
+                    std::string result = run_tool(call.name, call.args);//执行工具，得到结果
+                    record({"tool", call.name, call.args, result, call.id, now(), {}});//记录工具调用
+                    note_tool(call.name, call.args, result);//记录工具调用结果
+                }
                 continue;
             }
             // 非工具调用：模型给出最终答案，结束。
-            record({"assistant", "", {}, r.content, "", now()});
+            record({"assistant", "", {}, r.content, "", now(), {}});
             remember(memory_.notes, clip(r.content, 220), 5);
             return r.content;
         }
         std::string final = synthesize_after_step_limit();
-        record({"assistant", "", {}, final, "", now()});
+        record({"assistant", "", {}, final, "", now(), {}});
         remember(memory_.notes, clip(final, 220), 5);
         return final;
     }
@@ -183,7 +185,7 @@ private:
     // request_messages: 每轮构造原生 messages 数组；system 放静态前缀和蒸馏记忆，历史保持结构化。
     std::vector<HistoryItem> request_messages() const {
         std::vector<HistoryItem> messages;
-        messages.push_back({"system", "", {}, prefix_ + "\n\n" + memory_text(), "", ""});
+        messages.push_back({"system", "", {}, prefix_ + "\n\n" + memory_text(), "", "", {}});
         std::vector<HistoryItem> reduced = reduced_history();
         messages.insert(messages.end(), reduced.begin(), reduced.end());
         return messages;
@@ -197,7 +199,7 @@ private:
             "Tool call budget is exhausted. Do not call tools. "
             "Answer the latest user request directly using only the information already shown in the conversation. "
             "If some details are uncertain, state the uncertainty briefly.",
-            "", now()
+            "", now(), {}
         });
         ModelReply r = model_.complete(messages, {}, 768);
         if (r.content.empty()) return "Stopped after reaching the step limit without a final answer.";
@@ -207,33 +209,15 @@ private:
     // =======================================================================
     // 组件 4：Context Reduction —— 历史瘦身
     // =======================================================================
-    // reduced_history: 对结构化历史做瘦身；去掉较早重复 read_file，并保持 assistant/tool 成对出现。
+    // reduced_history: 对结构化历史做瘦身；保留 assistant/tool 配对，只裁剪较早内容长度。
     std::vector<HistoryItem> reduced_history() const {
         std::vector<HistoryItem> out;
         if (history_.empty()) return out;
-        std::vector<std::string> seen_reads;  // 已经读过的文件路径
         size_t recent_start = history_.size() > 6 ? history_.size() - 6 : 0;
 
         for (size_t i = 0; i < history_.size(); ++i) {
             const auto &it = history_[i];
             bool recent = i >= recent_start;
-
-            // 写操作后，把该文件从「已读集合」移除：文件已变，旧读取内容作废。
-            if (it.role == "tool" && (it.name == "write_file" || it.name == "patch_file")) {
-                auto p = it.args.count("path") ? it.args.at("path") : "";
-                seen_reads.erase(std::remove(seen_reads.begin(), seen_reads.end(), p), seen_reads.end());
-            }
-            // 较早的重复 read_file 直接跳过（去重）。
-            if (it.role == "tool" && it.name == "read_file" && !recent) {
-                auto p = it.args.count("path") ? it.args.at("path") : "";
-                if (std::find(seen_reads.begin(), seen_reads.end(), p) != seen_reads.end()) {
-                    out.erase(std::remove_if(out.begin(), out.end(), [&](const HistoryItem &old) {
-                        return old.role == "assistant" && old.tool_call_id == it.tool_call_id;
-                    }), out.end());
-                    continue;
-                }
-                seen_reads.push_back(p);
-            }
 
             size_t limit = recent ? 900 : 180;  // 越近的历史给越大额度
             HistoryItem kept = it;
@@ -250,8 +234,9 @@ private:
         if (items.empty()) return "- empty";
         std::vector<std::string> lines;
         for (const auto &it : items) {
-            if (it.role == "assistant" && !it.name.empty()) {
-                lines.push_back("[assistant.tool_call:" + it.name + "] " + args_to_string(it.args));
+            if (it.role == "assistant" && !it.tool_calls.empty()) {
+                for (const ToolCall &call : it.tool_calls)
+                    lines.push_back("[assistant.tool_call:" + call.name + "] " + args_to_string(call.args));
             } else if (it.role == "tool") {
                 lines.push_back("[tool:" + it.name + "] " + args_to_string(it.args));
                 lines.push_back(it.content);
@@ -282,11 +267,6 @@ private:
     // =======================================================================
     // record: 把一条历史追加到完整流水账（真实项目里此处会立即落盘以支持续接）。
     void record(const HistoryItem &item) { history_.push_back(item); }
-
-    // make_tool_call_id: 在 FakeModelClient 或兼容服务未返回 id 时，生成一个本地可配对的调用 id。
-    std::string make_tool_call_id() const {
-        return "call_local_" + std::to_string(history_.size() + 1);
-    }
 
     // note_tool: 从一次工具调用里蒸馏出「碰过的文件」与「一句话笔记」写入工作记忆。
     void note_tool(const std::string &name, const std::map<std::string, std::string> &args,

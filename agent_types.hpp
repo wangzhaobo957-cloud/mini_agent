@@ -21,14 +21,37 @@ struct ToolSpec {
     std::string description;
 };
 
+// ToolCall: 模型请求的一次具体工具调用，带 id/name/args 三元组。
+// {
+//   "id": "call_1",
+//   "type": "function",
+//   "function": {
+//     "name": "read_file",
+//     "arguments": "{\"path\":\"README.md\",\"start\":1,\"end\":80}"
+//   }
+// }
+// ToolCall{
+//     "call_1",
+//     "read_file",
+//     {
+//         {"path", "README.md"},
+//         {"start", "1"},
+//         {"end", "80"}
+//     }
+// }
+struct ToolCall {
+    std::string id;
+    std::string name;
+    std::map<std::string, std::string> args;
+};
+
 // ModelReply: 模型一轮回复的结构化结果 —— function calling 的核心。
-// 要么请求调用一个工具(is_tool_call=true, tool_name+args)，要么给出最终文本(content)。
+// 要么请求调用一批工具(is_tool_call=true, tool_calls)，要么给出最终文本(content)。
 // 对比文本协议：过去要靠 parse() 从自由文本里猜；现在模型直接给结构，无需解析、无需容错。
+//模型回复结构化结果
 struct ModelReply {
     bool is_tool_call = false;
-    std::string tool_name;
-    std::map<std::string, std::string> args;
-    std::string tool_call_id;  // 工具调用 id，用于把 assistant.tool_calls 与 tool 结果配对
+    std::vector<ToolCall> tool_calls;//可能有多轮工具调用
     std::string content;   // 非工具调用时的最终答案（或错误信息）
 };
 
@@ -40,13 +63,14 @@ struct HistoryItem {
     std::string content;                       // 文本内容 / 工具返回
     std::string tool_call_id;                  // 关联 assistant.tool_calls 与 tool 结果
     std::string created_at;
+    std::vector<ToolCall> tool_calls;          // 当 role=="assistant" 时可携带一批 tool_calls
 };
 
 // Memory: 蒸馏后的工作记忆，只保留「当前任务 + 碰过的文件 + 最近几条笔记」。
 struct Memory {
     std::string task;
-    std::vector<std::string> files;
-    std::vector<std::string> notes;
+    std::vector<std::string> files;// 碰过的文件路径
+    std::vector<std::string> notes;// 最近几条笔记
 };
 
 #endif  // AGENT_TYPES_HPP
